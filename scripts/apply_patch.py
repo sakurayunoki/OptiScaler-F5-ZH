@@ -230,6 +230,14 @@ def _reverse(gdict):
     return _ZH2EN
 
 
+def _escape_zh(s):
+    # 译文写回 C 字符串字面量前，把真实换行/回车/裸双引号转义成源码转义序列。
+    # 词典译文里若已含两字符反斜杠序列（如 "\n"），这里原样保留，不二次转义。
+    return (s.replace("\r", "\\r")
+             .replace("\n", "\\n")
+             .replace('"', '\\"'))
+
+
 def rewrite_literals(text, rel, gdict, ovr, rep):
     edits = []
     rev = _reverse(gdict)
@@ -265,7 +273,7 @@ def rewrite_literals(text, rel, gdict, ovr, rep):
 
         if zh is None or zh == value:
             continue
-        edits.append((s, e, '"' + zh + '"'))
+        edits.append((s, e, '"' + _escape_zh(zh) + '"'))
 
     for s, e, new in reversed(edits):
         text = text[:s] + new + text[e:]
