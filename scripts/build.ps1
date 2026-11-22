@@ -1,0 +1,224 @@
+﻿# OptiScaler-F5-DLSSNR-Multipass 汉化版构建脚本（GitHub Actions windows-latest）
+#
+# 前置：调用方已把 MSBuild 加进 PATH（microsoft/setup-msbuild@v2），
+#       且已跑过 scripts/apply_patch.py。
+#
+# 用法:
+#   pwsh scripts/build.ps1 -SourceDir <仓库根> -OutDir <产物目录>
+
+param(
+    [Parameter(Mandatory = $true)][string]$SourceDir,
+    [Parameter(Mandatory = $true)][string]$OutDir,
+    [string]$MsbuildPath = "",
+    # 默认把 NVIDIA Streamline（OptiScaler 自己输出 DLSS-G 时用的运行时）打进包，
+    # 对应上游 package_release.ps1 的 -IncludeDlssFrameGeneration。
+    # 用 [switch] 而不是 [bool]：CI 里 `-IncludeStreamline $true` 会被当成字符串传进来，
+    # 参数绑定直接报「Cannot convert System.String to System.Boolean」。
+    # 要出不含它的包就传 -SkipStreamline。
+    [switch]$SkipStreamline,
+    # 分发 NVIDIA 的 DLL 需要显式同意其许可；不给就拒绝打包（与上游行为一致）。
+    [switch]$AcceptNvidiaLicenses,
+    # 上游官方发布包（*with-dlss-fg.zip）。v0.1.36 起包里有 F5Low 帧生成器与
+    # libxess_fg 1.3.4.95，本仓库没有那个 kit，只能从这里提取。不给则跳过并警告。
+    [string]$F5LowSourceZip = ""
+)
+
+$ErrorActionPreference = 'Stop'
+
+$includeStreamline = -not $SkipStreamline
+
+# 1. 找 MSBuild。CI 里 setup-msbuild 已放进 PATH；本地用 vswhere 兜底。
+if ($MsbuildPath -and (Test-Path $MsbuildPath)) {
+    $msbuild = $MsbuildPath
+    Write-Host "MSBuild(指定): $msbuild"
+} else {
+    $cmd = Get-Command msbuild -ErrorAction SilentlyContinue
+    if ($cmd) {
+        $msbuild = $cmd.Source
+    } else {
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        if (-not (Test-Path $vswhere)) { throw "找不到 msbuild，也找不到 vswhere" }
+        $msbuild = & $vswhere -latest -requires Microsoft.Component.MSBuild -find "MSBuild\**\Bin\MSBuild.exe" | Select-Object -First 1
+    }
+    if (-not $msbuild) { throw "找不到 MSBuild" }
+    Write-Host "MSBuild: $msbuild"
+}
+
+# 2. 编译
+Push-Location $SourceDir
+try {
+    & $msbuild OptiScaler.sln /m /p:Configuration=Release /p:Platform=x64 /verbosity:minimal
+    if ($LASTEXITCODE -ne 0) { throw "MSBuild 失败，退出码 $LASTEXITCODE" }
+} finally {
+    Pop-Location
+}
+
+# 3. 收集产物。上游的 Release 后置事件已经把运行库、Licenses、setup 脚本、
+#    以及我们的 font\ 都拷进 x64\Release\a\，整目录拿走即可。
+$prod = Join-Path $SourceDir "x64\Release\a"
+if (-not (Test-Path $prod)) { throw "找不到构建产物: $prod" }
+
+New-Item $OutDir -ItemType Directory -Force | Out-Null
+Copy-Item (Join-Path $prod "*") $OutDir -Recurse -Force
+
+# 4. 剔除构建中间产物与不该随包发布的东西。
+#    整目录照搬会把转发器的 PDB/LIB/EXP 一起带出去。PDB 里有完整符号表和
+#    构建机的源码路径，对用户没用、还泄漏路径，不该随包发布。
+#    上游 package_release.ps1 的剔除列表是：
+#        *.exp *.lib *.pdb *.ilk *latewarp* *.asi *nrtrace*
+#    这里原来只对了前四个 —— ASI 插件不该进包（插件由用户自己放），
+#    latewarp / nrtrace 是废弃的实验产物与挂钩 CUDA 驱动的研究探针（会在自身旁边
+#    转储模块），都不该出现。2026-10-30 补齐。
+$junk = @(Get-ChildItem $OutDir -Recurse -File |
+          Where-Object { $_.Extension -in '.pdb', '.lib', '.exp', '.ilk' -or
+                         $_.Name -like '*latewarp*' -or
+                         $_.Extension -eq '.asi' -or
+                         $_.Name -like '*nrtrace*' })
+foreach ($f in $junk) {
+    Write-Host ("  剔除 {0} ({1:N2} MB)" -f $f.Name, ($f.Length / 1MB))
+    Remove-Item $f.FullName -Force
+}
+
+# 5. 补上游发布包里那些「来自仓库根、不在 x64\Release\a\」的文件。
+#    编译后置事件不拷这些，只搬 a\ 会漏掉。
+#    列表必须与 package_release.ps1 的 $sourceFiles 逐项对齐 —— 少一个就是静默缺件
+#    （TROUBLESHOOTING.md 从 v0.1.33 起就漏了，27 KB 的排障文档一直没进包）。
+foreach ($f in @('OptiScaler.ini', 'setup_windows.bat', 'setup_linux.sh',
+                 'get_streamline.ps1', 'README.md', 'INSTALL-DLSSNR.md',
+                 'TROUBLESHOOTING.md', 'LICENSE')) {
+    $p = Join-Path $SourceDir $f
+    if (Test-Path $p) { Copy-Item $p $OutDir -Force }
+    else { Write-Host "  (上游没有，跳过) $f" }
+}
+foreach ($d in @('docs', 'redist')) {
+    $p = Join-Path $SourceDir $d
+    if (Test-Path $p) { Copy-Item $p $OutDir -Recurse -Force }
+}
+
+# 5.5 NVIDIA Streamline —— 让 OptiScaler 自己输出 DLSS-G 时用的运行时。
+#
+#     上游 package_release.ps1 在 -IncludeDlssFrameGeneration 时会调 get_streamline.ps1，
+#     由它按 redist\streamline\manifest.json 下载 NVIDIA 官方 SDK、校验 SHA-256 与
+#     Authenticode 签名、只挑 allowlist 里的 6 个 DLL 放进 OptiScaler\streamline\。
+#
+#     本脚本原来只搬了 redist\（清单），没执行下载 —— 结果发布包里缺整个
+#     OptiScaler\streamline\ 目录（6 个 DLL、约 11 MB），凡是
+#     FG Output = DLSSG 或 FGNvngxReplacement 的用法都会缺件。2026-10-22 补上。
+if ($includeStreamline) {
+    if (-not $AcceptNvidiaLicenses) {
+        throw ("IncludeStreamline 会随包分发 NVIDIA 的 DLL，需要 -AcceptNvidiaLicenses。" +
+               "先读 docs/DLSS-FRAME-GENERATION.md 与其中的 NVIDIA 许可；" +
+               "或传 -SkipStreamline 出一个不含 Streamline 的包。")
+    }
+
+    # 位置必须是 <包根>\OptiScaler\streamline —— OptiScaler 只在
+    # <DLL 目录>\OptiScaler\streamline\ 下找它（Util.cpp:534 `optiPath /= L"streamline"`）。
+    # 放到包根\streamline 是错的：那个目录游戏看不到，等于没带。
+    $slDir = Join-Path $OutDir 'OptiScaler\streamline'
+    if (Test-Path -LiteralPath $slDir) {
+        throw "产物里已存在 streamline 目录（$slDir）：不接受来源不明的 Stack，先清掉再打包。"
+    }
+
+    Write-Host "取 NVIDIA Streamline（DLSS-G 输出运行时）..."
+    # get_streamline.ps1 用 throw 报错，$ErrorActionPreference = 'Stop' 会让失败直接中断构建
+    # —— 这是想要的：宁可这次不发版，也不要悄悄发出一个缺件的包。
+    & (Join-Path $SourceDir 'get_streamline.ps1') -Destination $slDir -AcceptNvidiaLicenses
+}
+
+# 5.6 F5Low 帧生成器（v0.1.36 新增）。
+#
+#     上游 package_release.ps1 从一个独立仓库的 kit（f5low-kit-<ver>.zip，git 忽略的
+#     external\f5low）取这些文件，并用 kit_hashes.txt + Intel 签名做严格校验：
+#       f5low.dll            -> OptiScaler\plugins\（OptiScaler 默认 [Plugins] Path）
+#       libxess_fg.dll       -> OptiScaler\libxess_fg.dll，替换掉 MSBuild 从
+#                               external\xess\bin 拷来的 1.3.1.78（kit 里是 1.3.4.95）
+#       f5low_LICENSE.txt / f5low_README-KIT.txt / f5low_zstd_LICENSE.txt -> Licenses\
+#
+#     我们的 CI 拿不到 kit（它不在本仓库），所以改成从**上游官方发布包**里提取这 5 个
+#     文件 —— 上游包本身就是经过它那套校验之后打出来的。没给 -F5LowSourceZip 就警告并
+#     继续（包会缺 F5Low，但其余功能正常）。
+if ($F5LowSourceZip) {
+    if (-not (Test-Path -LiteralPath $F5LowSourceZip)) {
+        throw "找不到 F5Low 源包: $F5LowSourceZip"
+    }
+
+    Write-Host "取 F5Low 帧生成器（从上游发布包提取）..."
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $f5map = [ordered]@{
+        'OptiScaler/plugins/f5low.dll'      = 'OptiScaler\plugins\f5low.dll'
+        'OptiScaler/libxess_fg.dll'         = 'OptiScaler\libxess_fg.dll'
+        'Licenses/f5low_LICENSE.txt'        = 'Licenses\f5low_LICENSE.txt'
+        'Licenses/f5low_README-KIT.txt'     = 'Licenses\f5low_README-KIT.txt'
+        'Licenses/f5low_zstd_LICENSE.txt'   = 'Licenses\f5low_zstd_LICENSE.txt'
+    }
+    $zip = [IO.Compression.ZipFile]::OpenRead((Resolve-Path -LiteralPath $F5LowSourceZip).ProviderPath)
+    try {
+        foreach ($entry in $f5map.Keys) {
+            $e = $zip.GetEntry($entry)
+            if (-not $e) { throw "上游包里缺 $entry —— 上游可能改了 F5Low 的打包布局" }
+            $dest = Join-Path $OutDir $f5map[$entry]
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $dest) | Out-Null
+            [IO.Compression.ZipFileExtensions]::ExtractToFile($e, $dest, $true)
+            Write-Host ("  F5Low: {0} ({1:N0} 字节)" -f $f5map[$entry], $e.Length)
+        }
+    } finally {
+        $zip.Dispose()
+    }
+} else {
+    Write-Warning "未提供 -F5LowSourceZip：包内不会有 F5Low 帧生成器（OptiScaler\plugins\f5low.dll）与 libxess_fg 1.3.4.95"
+}
+
+# 6. 自检：汉化版的两个标志物必须在产物里，否则说明补丁没生效就打包了
+$dll = Join-Path $OutDir "OptiScaler.dll"
+if (-not (Test-Path $dll)) { throw "产物缺 OptiScaler.dll" }
+$font = Join-Path $OutDir "font\wqy-microhei.ttc"
+if (-not (Test-Path $font)) { throw "产物缺 font\wqy-microhei.ttc —— 中文字体会渲染不出来" }
+
+# 上游 $sourceFiles 里每个都必须在（少一个就是静默缺件）
+foreach ($f in @('OptiScaler.ini', 'INSTALL-DLSSNR.md', 'TROUBLESHOOTING.md', 'LICENSE')) {
+    if (-not (Test-Path (Join-Path $OutDir $f))) { throw "产物缺 $f（上游发布包里有）" }
+}
+
+# Streamline 若声明要带，6 个 DLL 一个都不能少（清单见 redist\streamline\manifest.json）
+if ($includeStreamline) {
+    $slDir = Join-Path $OutDir 'OptiScaler\streamline'
+    $slNeed = @('sl.interposer.dll', 'sl.common.dll', 'sl.dlss_g.dll',
+                'sl.reflex.dll', 'sl.pcl.dll', 'nvngx_dlssg.dll')
+    foreach ($n in $slNeed) {
+        if (-not (Test-Path (Join-Path $slDir $n))) { throw "产物缺 OptiScaler\streamline\$n" }
+    }
+    Write-Host "Streamline: OptiScaler\streamline\ 下 6 个 DLL 齐全"
+} else {
+    Write-Host "Streamline: 按 -SkipStreamline 跳过（包内不会有 DLSS-G 输出运行时）"
+}
+
+# F5Low 若声明要带，5 个文件一个都不能少
+if ($F5LowSourceZip) {
+    foreach ($rel in @('OptiScaler\plugins\f5low.dll', 'OptiScaler\libxess_fg.dll',
+                       'Licenses\f5low_LICENSE.txt', 'Licenses\f5low_README-KIT.txt',
+                       'Licenses\f5low_zstd_LICENSE.txt')) {
+        if (-not (Test-Path (Join-Path $OutDir $rel))) { throw "产物缺 $rel" }
+    }
+    $intel = (Get-Item (Join-Path $OutDir 'OptiScaler\libxess_fg.dll')).VersionInfo.FileVersion
+    Write-Host "F5Low: 5 个文件齐全，libxess_fg.dll = $intel"
+}
+
+# 7. 生成 SHA256SUMS.txt（上游发布包里也有，用于校验下载完整性）。
+#    显式用无 BOM 的 UTF-8：PowerShell 5.1 的 -Encoding utf8 会写 BOM，
+#    校验工具读到 BOM 会认不出第一行。
+#    先归一化成绝对路径再算相对名 —— 否则 $OutDir 带尾斜杠或写成相对路径时
+#    Substring 会切错位置，生成一堆残缺文件名。
+$root = (Get-Item $OutDir).FullName
+$sums = Get-ChildItem $root -Recurse -File |
+        Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
+        Sort-Object FullName |
+        ForEach-Object {
+            $rel = $_.FullName.Substring($root.Length).TrimStart('\', '/') -replace '\\', '/'
+            "{0}  {1}" -f (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower(), $rel
+        }
+[System.IO.File]::WriteAllLines((Join-Path $root 'SHA256SUMS.txt'), $sums,
+                                (New-Object System.Text.UTF8Encoding $false))
+
+Write-Host "产物目录: $OutDir"
+$files = Get-ChildItem $root -Recurse -File
+Write-Host ("合计 {0} 个文件，{1:N1} MB" -f $files.Count, (($files | Measure-Object Length -Sum).Sum / 1MB))

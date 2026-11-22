@@ -1,0 +1,505 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+汉化重放器：把汉化资产套用到任意版本的 OptiScaler-F5-DLSSNR-Multipass 源码上。
+
+用法:
+    python scripts/apply_patch.py <源码根目录> [--check] [--report out.json]
+
+三条流水线，依次执行：
+    1. 结构规则  dict/structural.json   —— 代码/构建配置改动，锚点是原文片段，不是行号
+    2. 字面量改写 dict/strings.json + dict/overrides.json —— 锚点是英文原文
+    3. 覆盖文件  overlay/               —— 汉化独有的新文件（字形范围表、字体）
+
+设计要点：
+  * 幂等。重复跑不会二次替换（已含汉字的字面量直接跳过，结构规则看 marker）。
+  * 锚点缺失 = 报错退出，不是静默跳过。上游改了同一处代码时 CI 必须红，而不是出一个半汉化的包。
+  * 只改 dict/targets.json 圈定的文件。
+"""
+import argparse
+import glob
+import io
+import json
+import os
+import re
+import shutil
+import sys
+import textwrap
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+DICT = os.path.join(ROOT, "dict")
+OVERLAY = os.path.join(ROOT, "overlay")
+
+
+# ---------------------------------------------------------------- 字面量扫描
+
+def scan_groups(text):
+    """切出所有「字面量组」，返回 [(value, start, end)]。
+
+    相邻字面量（C 的 `"a" "b"` 拼接语法，可跨行）合成一个逻辑串，
+    这样多行 HelpMarker 折成一行或拆成多行都能正确命中。
+    """
+    groups = []
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            i = n if j < 0 else j + 1
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+            continue
+        if c == "'":
+            i += 1
+            while i < n:
+                if text[i] == "\\":
+                    i += 2
+                    continue
+                if text[i] == "'":
+                    i += 1
+                    break
+                i += 1
+            continue
+        if c == '"':
+            gstart = i
+            parts = []
+            while True:
+                i += 1
+                buf = []
+                while i < n:
+                    if text[i] == "\\":
+                        buf.append(text[i : i + 2])
+                        i += 2
+                        continue
+                    if text[i] == '"':
+                        break
+                    buf.append(text[i])
+                    i += 1
+                parts.append("".join(buf))
+                gend = i + 1
+                i += 1
+                j = i
+                while j < n and text[j] in " \t\r\n":
+                    j += 1
+                if j < n and text[j] == '"':
+                    i = j
+                    continue
+                break
+            groups.append(("".join(parts), gstart, gend))
+            continue
+        i += 1
+    return groups
+
+
+def has_cjk(s):
+    """判断一个字面量是不是已经是中文。
+
+    不能只查 CJK 表意文字（U+4E00..U+9FFF）：中文全角标点落在 U+3000..U+303F
+    和 U+FF00..U+FFEF，只看汉字的话「（DXVK） 」这种「全角标点 + 拉丁字母」的串
+    会被当成英文，每轮都被重新报成待翻译。
+
+    全角区里要排掉全角字母数字（Ａ-Ｚ ０-９ ａ-ｚ）—— 它们只是字宽变体，
+    不构成「已经是中文」的证据。
+    """
+    for ch in s:
+        o = ord(ch)
+        if 0x4E00 <= o <= 0x9FFF:      # 汉字
+            return True
+        if 0x3000 <= o <= 0x303F:      # 中文标点 、。《》「」
+            return True
+        if 0xFF00 <= o <= 0xFFEF:
+            if 0xFF10 <= o <= 0xFF19 or 0xFF21 <= o <= 0xFF3A or 0xFF41 <= o <= 0xFF5A:
+                continue               # 全角字母数字，不算
+            return True
+    return False
+
+
+def line_of(text, pos):
+    s = text.rfind("\n", 0, pos) + 1
+    e = text.find("\n", pos)
+    return text[s : len(text) if e < 0 else e]
+
+
+def is_include_line(line, pos_in_line):
+    return re.match(r"\s*#\s*include\b", line[:pos_in_line]) is not None
+
+
+# ---------------------------------------------------------------- 文件读写
+
+def read_text(path):
+    with io.open(path, "rb") as f:
+        raw = f.read()
+    bom = raw.startswith(b"\xef\xbb\xbf")
+    if bom:
+        raw = raw[3:]
+    crlf = raw.count(b"\r\n") > raw.count(b"\n") / 2
+    text = raw.decode("utf-8", errors="replace")
+    if crlf:
+        text = text.replace("\r\n", "\n")
+    return text, bom, crlf
+
+
+def write_text(path, text, bom, crlf):
+    if crlf:
+        text = text.replace("\n", "\r\n")
+    data = text.encode("utf-8")
+    if bom:
+        data = b"\xef\xbb\xbf" + data
+    with io.open(path, "wb") as f:
+        f.write(data)
+
+
+# ---------------------------------------------------------------- 结构规则
+
+def flex_regex(block):
+    """把代码块编译成「空白不敏感」的正则：换行、缩进怎么变都能命中。"""
+    parts = [re.escape(p) for p in re.split(r"\s+", block.strip())]
+    return re.compile(r"\s+".join(parts))
+
+
+def apply_structural(text, rule, rep):
+    mode = rule["mode"]
+    marker = rule.get("marker")
+
+    if mode in ("replace", "replace_all"):
+        if marker and marker in text:
+            rep["skipped"].append(rule["id"])
+            return text
+        before = rule["before"]
+        if mode == "replace_all":
+            cnt = text.count(before)
+            if cnt == 0:
+                rep["failed"].append({"id": rule["id"], "why": "锚点未命中"})
+                return text
+            rep["applied"].append({"id": rule["id"], "hits": cnt})
+            return text.replace(before, rule["after"])
+        m = flex_regex(before).search(text)
+        if not m:
+            rep["failed"].append({"id": rule["id"], "why": "锚点未命中"})
+            return text
+        indent = re.match(r"[ \t]*", text[text.rfind("\n", 0, m.start()) + 1 :]).group(0)
+        new = textwrap.indent(textwrap.dedent(rule["after"]), indent)
+        rep["applied"].append({"id": rule["id"], "hits": 1})
+        return text[: m.start()] + new + text[m.end() :]
+
+    if mode == "insert_after":
+        if marker and marker in text:
+            rep["skipped"].append(rule["id"])
+            return text
+        anchor = rule["anchor"]
+        lines = text.split("\n")
+        idx = next((i for i, l in enumerate(lines) if anchor in l), None)
+        if idx is None:
+            rep["failed"].append({"id": rule["id"], "why": "锚点未命中"})
+            return text
+        indent = re.match(r"[ \t]*", lines[idx]).group(0)
+        ins = [(indent + l if l.strip() else l) for l in rule["after"].split("\n")]
+        rep["applied"].append({"id": rule["id"], "hits": 1})
+        return "\n".join(lines[: idx + 1] + ins + lines[idx + 1 :])
+
+    rep["failed"].append({"id": rule["id"], "why": f"未知 mode: {mode}"})
+    return text
+
+
+# ---------------------------------------------------------------- 字面量改写
+
+_ZH2EN = None
+_ZH2EN_SRC = None
+
+
+def _reverse(gdict):
+    """译文 -> 原文（一对多）的反查表。用来认出手上这份源码里已经汉化过的字面量。
+
+    必须是一对多：词典里存在多个英文原文共用一个译文的条目
+    （Default/DEFAULT、Off/Close、Zoom/Scale 这类），用一对一映射会漏记。
+    """
+    global _ZH2EN, _ZH2EN_SRC
+    if _ZH2EN_SRC is not gdict:
+        _ZH2EN = {}
+        for en, zh in gdict.items():
+            _ZH2EN.setdefault(zh, []).append(en)
+        _ZH2EN_SRC = gdict
+    return _ZH2EN
+
+
+def rewrite_literals(text, rel, gdict, ovr, rep):
+    edits = []
+    rev = _reverse(gdict)
+    # "*" 是全局规则，文件级规则覆盖同名键
+    file_ovr = dict(ovr.get("*", {}))
+    file_ovr.update(ovr.get(rel, {}))
+    for value, s, e in scan_groups(text):
+        if has_cjk(value):
+            # 已经汉化的字面量反查词典记成「已应用」。不这么做的话，
+            # 对同一份源码重复跑一次，词典里上千条都会算成「未命中」，
+            # 把真正的「上游改了这个串」信号淹掉。
+            en = rev.get(value)
+            if en:
+                rep["applied_before"].update(en)
+            continue
+        line = line_of(text, s)
+        if is_include_line(line, s - (text.rfind("\n", 0, s) + 1)):
+            continue
+
+        zh = None
+        rules = file_ovr.get(value)
+        if rules is not None:
+            for r in rules:
+                ctx = r.get("ctx")
+                if ctx is None or ctx in line:
+                    zh = r["zh"]
+                    rep["override_hits"].append(f"{rel}: {value!r} -> {zh!r}")
+                    rep["override_keys"].add(value)
+                    break
+        elif value in gdict:
+            zh = gdict[value]
+            rep["dict_hits"][value] = rep["dict_hits"].get(value, 0) + 1
+
+        if zh is None or zh == value:
+            continue
+        edits.append((s, e, '"' + zh + '"'))
+
+    for s, e, new in reversed(edits):
+        text = text[:s] + new + text[e:]
+    rep["literal_files"][rel] = len(edits)
+    return text
+
+
+# ---------------------------------------------------------------- 字形范围表
+
+GLYPH_REL = "OptiScaler/menu/font/ChineseGlyphRanges.h"
+
+# 固定区段：拉丁 + 拉丁补充、常用标点、CJK 标点、制表符、全角形式。
+# 译文里用到 ，。：（）「」《》—— 这些落在全角/CJK 标点区，必须整段带上。
+GLYPH_BASE = [(0x0020, 0x00FF), (0x2010, 0x203A), (0x2044, 0x2044),
+              (0x2500, 0x2500), (0x3000, 0x303F), (0xFF00, 0xFFEF)]
+GLYPH_EXTRA = {0x00B7, 0x00D7, 0x2014, 0x2018, 0x2019, 0x201C, 0x201D, 0x2026}
+
+
+def build_glyph_ranges(texts):
+    """按「实际用到的非 ASCII 码点」生成 ImGui 字形范围表。
+
+    这张表决定 ImGui 把哪些字烤进字体图集 —— **没列进去的字在界面上就是空白**。
+    所以它必须由当前译文生成，不能在词典改动后继续沿用旧表。
+
+    实测教训（2026-10-11）：表是上一批译文时生成的（886 个码点），之后又补了两批
+    译文，64 个新用到的汉字（三/九/伏/伸/依/借/充/八/冷/口/圆/声/奔/密/察/寻/尾/
+    广/弃/拍/拢/挫/搬/播/斑/旦/暖/曾/段/波/洋/涂/润/烈/片/玻/璃/盒/眼/睛/短/离/
+    突/窗/群/荒/落/访/评/诉/词/谓/象/跑/轮/连/逐/避/邻/野…）不在表里，
+    界面直接显示空白，而且没有任何报错 —— 只能靠人眼看出来。
+    """
+    cps = set(GLYPH_EXTRA)
+    for t in texts:
+        for ch in t:
+            o = ord(ch)
+            if o > 0x7F:
+                cps.add(o)
+
+    allc = set(cps)
+    for a, b in GLYPH_BASE:
+        allc.update(range(a, b + 1))
+    allc = sorted(allc)
+
+    ranges = []
+    start = prev = allc[0]
+    for c in allc[1:]:
+        if c == prev + 1:
+            prev = c
+            continue
+        ranges.append((start, prev))
+        start = prev = c
+    ranges.append((start, prev))
+
+    body = "\n".join(f"    0x{a:04x}, 0x{b:04x}," for a, b in ranges)
+    head = (
+        "#pragma once\n"
+        "\n"
+        "// Generated glyph range table for the Simplified Chinese localization.\n"
+        "// Covers Basic Latin / Latin-1, common punctuation, CJK punctuation, fullwidth forms,\n"
+        "// plus every CJK character that actually appears in the translated UI strings\n"
+        f"// ({len(cps)} distinct non-ASCII code points).\n"
+        "//\n"
+        "// Used instead of ImFontAtlas::GetGlyphRangesDefault() (Latin only) so the Chinese\n"
+        "// interface text renders with the bundled/loaded CJK font.\n"
+        "//\n"
+        "// GENERATED by scripts/apply_patch.py from dict/strings.json -- do not edit by hand.\n"
+        "// A character missing here renders as a blank box, with no error anywhere.\n"
+        "\n"
+        "#include <imgui/imgui.h>\n"
+        "\n"
+        "namespace OptiScalerLocalization\n"
+        "{\n"
+        "inline const ImWchar* ChineseGlyphRanges()\n"
+        "{\n"
+        "    static const ImWchar ranges[] = {\n"
+    )
+    tail = (
+        "\n"
+        "        0,\n"
+        "    };\n"
+        "    return ranges;\n"
+        "}\n"
+        "} // namespace OptiScalerLocalization\n"
+    )
+    return head + body + tail
+
+
+def write_glyph_ranges(src, texts, rep, write=True):
+    """把生成的字形范围表写进工作区（覆盖 overlay 带进来的那份）。
+
+    必须在「覆盖文件」这一步之后调用 —— 否则会被 overlay 的旧表盖回去。
+    """
+    path = os.path.join(src, GLYPH_REL)
+    content = build_glyph_ranges(texts)
+    old = None
+    if os.path.exists(path):
+        old = io.open(path, encoding="utf-8", errors="replace").read()
+    if old == content:
+        rep["glyph_ranges"] = "unchanged"
+    else:
+        rep["glyph_ranges"] = "would-update" if not write else "updated"
+        if write:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            io.open(path, "w", encoding="utf-8", newline="\n").write(content)
+    return content
+
+
+# ---------------------------------------------------------------- 主流程
+
+def expand_targets(src, cfg):
+    """按 globs 展开目标文件。
+
+    用 glob 的 recursive=True —— `**` 能匹配零层目录，所以
+    `OptiScaler/menu/**/*.cpp` 既覆盖 menu/menu_common.cpp 也覆盖 menu/input/*.cpp。
+    fnmatch 做不到这点（它的 `**` 退化成普通 `*`，中间那个 `/` 会把同层文件漏掉）。
+    """
+    out = set()
+    for g in cfg["globs"]:
+        for p in glob.glob(os.path.join(src, g), recursive=True):
+            if os.path.isfile(p):
+                out.add(os.path.relpath(p, src).replace("\\", "/"))
+    for e in cfg.get("exclude", []):
+        out.discard(e)
+    return sorted(out)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("source")
+    ap.add_argument("--check", action="store_true", help="只报告不写盘")
+    ap.add_argument("--report", default=None)
+    args = ap.parse_args()
+
+    src = os.path.abspath(args.source)
+    if not os.path.isdir(src):
+        raise SystemExit(f"源码目录不存在: {src}")
+
+    gdict = json.load(io.open(os.path.join(DICT, "strings.json"), encoding="utf-8"))
+    ovr = json.load(io.open(os.path.join(DICT, "overrides.json"), encoding="utf-8"))
+    # 下划线开头的键是文档注释，不是规则
+    for k in [k for k in ovr if k.startswith("_")]:
+        ovr.pop(k)
+    struct = json.load(io.open(os.path.join(DICT, "structural.json"), encoding="utf-8"))
+    cfg = json.load(io.open(os.path.join(DICT, "targets.json"), encoding="utf-8"))
+
+    rep = {"applied": [], "skipped": [], "failed": [], "override_hits": [],
+           "override_keys": set(), "dict_hits": {}, "literal_files": {}, "overlay": [],
+           "applied_before": set()}
+
+    # 1) 结构规则
+    by_file = {}
+    for r in struct:
+        by_file.setdefault(r["file"], []).append(r)
+    for rel, rules in sorted(by_file.items()):
+        path = os.path.join(src, rel)
+        if not os.path.exists(path):
+            for r in rules:
+                rep["failed"].append({"id": r["id"], "why": f"目标文件不存在: {rel}"})
+            continue
+        text, bom, crlf = read_text(path)
+        for r in rules:
+            text = apply_structural(text, r, rep)
+        if not args.check:
+            write_text(path, text, bom, crlf)
+
+    # 2) 字面量改写
+    targets = expand_targets(src, cfg)
+    for rel in targets:
+        path = os.path.join(src, rel)
+        text, bom, crlf = read_text(path)
+        new = rewrite_literals(text, rel, gdict, ovr, rep)
+        if new != text and not args.check:
+            write_text(path, new, bom, crlf)
+
+    # 3) 覆盖文件
+    for dirpath, dirnames, filenames in os.walk(OVERLAY):
+        for fn in filenames:
+            s = os.path.join(dirpath, fn)
+            rel = os.path.relpath(s, OVERLAY)
+            d = os.path.join(src, rel)
+            rep["overlay"].append(rel.replace("\\", "/"))
+            if not args.check:
+                os.makedirs(os.path.dirname(d), exist_ok=True)
+                shutil.copy2(s, d)
+
+    # 3.5) 字形范围表按当前译文重新生成。
+    #      这张表决定哪些汉字被烤进字体图集，没列进去的字在界面上是空白且无任何报错。
+    #      必须放在覆盖文件之后 —— overlay 里带的是上次生成的旧表，会被这一步覆盖。
+    glyph_texts = list(gdict.values())
+    for m in ovr.values():
+        for rules in m.values():
+            for r in rules:
+                if r.get("zh"):
+                    glyph_texts.append(r["zh"])
+    for r in struct:
+        if r.get("after"):
+            glyph_texts.append(r["after"])
+    write_glyph_ranges(src, glyph_texts, rep, write=not args.check)
+
+    # 4) 统计：词典里哪些条目一次都没命中
+    #    被 overrides 接管的条目（Auto / yes / no / Balanced / Neural Rendering 这类
+    #    上下文相关的串）也算命中 —— 它们只是没走全局词典这条路。
+    #    已汉化过的字面量（重复运行时）同样算命中，见 rewrite_literals。
+    used = set(rep["dict_hits"]) | set(rep["override_keys"]) | set(rep["applied_before"])
+    unused = sorted(set(gdict) - used)
+    rep["unused_dict_entries"] = unused
+    rep["override_keys"] = sorted(rep["override_keys"])
+    rep["applied_before"] = sorted(rep["applied_before"])
+
+    total_lit = sum(rep["literal_files"].values())
+    print(f"目标文件 {len(targets)} 个，字面量替换 {total_lit} 处")
+    print(f"结构规则：应用 {len(rep['applied'])}，已存在跳过 {len(rep['skipped'])}，失败 {len(rep['failed'])}")
+    print(f"覆盖文件 {len(rep['overlay'])} 个")
+    print(f"字形范围表：{rep.get('glyph_ranges', 'n/a')}"
+          + ("（overlay 里的是旧表，已按当前词典重新生成）"
+             if rep.get("glyph_ranges") == "updated" else ""))
+    print(f"词典 {len(gdict)} 条，命中 {len(used & set(gdict))}，未命中 {len(unused)} 条")
+    if rep["applied_before"]:
+        print(f"  （其中 {len(rep['applied_before'])} 条是这份源码里已经汉化过的字面量，重复运行时正常）")
+    if unused:
+        print("  未命中前 10 条（上游可能已删除该串）:")
+        for u in unused[:10]:
+            print(f"    {u[:90]!r}")
+
+    if args.report:
+        with io.open(args.report, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(rep, f, ensure_ascii=False, indent=1)
+        print(f"报告 -> {args.report}")
+
+    if rep["failed"]:
+        print("\n!! 结构锚点未命中，汉化不完整，必须人工修复：")
+        for x in rep["failed"]:
+            print(f"   {x['id']}: {x['why']}")
+        sys.exit(2)
+
+
+if __name__ == "__main__":
+    main()

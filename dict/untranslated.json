@@ -1,0 +1,92 @@
+{
+ "FGId: %llu, RfxId: %llu": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "帧生成内部句柄 ID，参考汉化版保持英文"
+ },
+ "FPS: %6.1f/%5.1f, Avg: %6.1f": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "FPS 叠加层的诊断读数，参考汉化版保持英文"
+ },
+ "FSR %s": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "FSR 版本标签（%s 是版本号），参考汉化版保持英文"
+ },
+ "FSR %s##%d": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "FSR 版本标签（%s 是版本号），参考汉化版保持英文"
+ },
+ "FSR 3.1 FG: %s": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "DLL 名 + 版本号，参考汉化版保持英文"
+ },
+ "FSR 3.1 SR: %s": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "DLL 名 + 版本号，参考汉化版保持英文"
+ },
+ "FSR 3.1: %s": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "DLL 名 + 版本号，参考汉化版保持英文"
+ },
+ "In use: %s": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "DLSS-G 运行时名称，诊断行，保持英文便于对日志"
+ },
+ "In use: %s (nvngx_dlssg %u.%u.%u)": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "DLSS-G 运行时名称与版本号，诊断行，保持英文便于对日志"
+ },
+ "Splash": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "ImGui 窗口名，仅作内部 ID，界面不显示（该窗口无边框无标题）"
+ },
+ "Vulkan %s| %s %d.%d.%d%s": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "Vulkan 驱动版本行，参考汉化版保持英文"
+ },
+ "libxess: %s": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "DLL 名 + 版本号，参考汉化版保持英文"
+ },
+ "nvngx.dll: %s": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "DLL 名 + 版本号，参考汉化版保持英文"
+ },
+ "nvngx_dlss : %s": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "DLL 名 + 版本号，参考汉化版保持英文"
+ },
+ "nvngx_dlssd : %s": {
+  "seen_in": [
+   "OptiScaler/menu/menu_common.cpp"
+  ],
+  "why": "DLL 名 + 版本号，参考汉化版保持英文"
+ }
+}
